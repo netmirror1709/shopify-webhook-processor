@@ -1,0 +1,84 @@
+services:
+  webhook-processor:
+    build: .
+    container_name: shopify-webhook-processor
+    restart: always
+    ports:
+      - "3003:3003"
+    env_file:
+      - .env
+    networks:
+      - shared-services-network
+    depends_on:
+      - rabbitmq
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: shopify-rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    networks:
+      - shared-services-network
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  postgres:
+    container_name: postgres
+    image: postgres:latest           # Official Postgres image
+    restart: on-failure              # Restart if the container fails
+    volumes:
+      - postgres_data:/var/lib/postgresql 
+    environment:
+      POSTGRES_USER: postgres            # Set DB user inside the container
+      POSTGRES_DB: postgres              # Create this database on first run
+      POSTGRES_PASSWORD: postgres        # Set the password for the DB user
+    healthcheck:                     # Ensure the DB is ready before starting dependent services
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    ports:
+      - '5432:5432'                  # Optional: expose Postgres on localhost for debugging
+    networks:
+      - shared-services-network
+      
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    networks:
+      - shared-services-network
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: eyJhIjoiZDNlMzE1NmY4ZGQwYWM1MDY3YjcyZDQzNTVhMGNlMWIiLCJ0IjoiNTQwNWIyOGEtZWZjOS00MWIwLTk1YTUtODIwYzQwMzliMTM4IiwicyI6IlpXVm1NbVJtTVdNdFlqZzBNQzAwTkdaaExUbGtaVEl0TURjMk0yRTBNR013TW1RMSJ9
+
+  pgadmin:
+    image: dpage/pgadmin4:latest  # Official pgAdmin image
+    container_name: pgadmin
+    restart: on-failure
+    networks:
+      - shared-services-network
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com  # pgAdmin login email
+      PGADMIN_DEFAULT_PASSWORD: admin         # pgAdmin login password
+      PGADMIN_LISTEN_PORT: 5050                 # pgAdmin web UI port
+    ports:
+      - "5050:5050"  # Expose pgAdmin on port 5050
+    depends_on:
+      - postgres   # Ensure pgAdmin starts after PostgreSQL is available
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin  # Persist pgAdmin data
+
+networks:
+  shared-services-network:
+    external: true
+
+volumes:
+  postgres_data: {}
+  pgadmin_data: {}
+  rabbitmq_data: {}
