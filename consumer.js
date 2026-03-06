@@ -150,7 +150,6 @@ async function adjustShopifyInventory({
 
 async function updateInventory(variantId, delta)  {
   try {
-    variantId = 46264568774806;
     // 4️⃣ Process each variant in a DB transaction with row locking
     const client = await pool.connect();
     
