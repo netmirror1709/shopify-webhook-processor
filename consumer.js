@@ -167,7 +167,7 @@ async function updateInventory(variantId, delta) {
             "storeAccessKey"
           FROM "InventoryGroupVariant"
           WHERE "groupId" = (SELECT "groupId" FROM "InventoryGroupVariant"
-          WHERE "variantId" LIKE '%' || $1 || '%')
+          WHERE "variantId" LIKE '%' || $1 || '%') AND "variantId" NOT LIKE '%' || $1 || '%'
           FOR UPDATE SKIP LOCKED
         `;
 
