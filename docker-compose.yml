@@ -10,7 +10,8 @@ services:
     networks:
       - shared-services-network
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
 
   rabbitmq:
     image: rabbitmq:3-management
@@ -20,12 +21,17 @@ services:
       - "5672:5672"
       - "15672:15672"
     environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
     networks:
       - shared-services-network
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
       
   cloudflared:
@@ -36,15 +42,15 @@ services:
       - shared-services-network
     command: tunnel run
     environment:
-      TUNNEL_TOKEN: eyJhIjoiZDNlMzE1NmY4ZGQwYWM1MDY3YjcyZDQzNTVhMGNlMWIiLCJ0IjoiNTQwNWIyOGEtZWZjOS00MWIwLTk1YTUtODIwYzQwMzliMTM4IiwicyI6IlpXVm1NbVJtTVdNdFlqZzBNQzAwTkdaaExUbGtaVEl0TURjMk0yRTBNR013TW1RMSJ9
+      TUNNEL_TOKEN: ${CLOUDFLARED_TUNNEL_TOKEN}
 
   postgres:
     image: postgres:15
     restart: always
     environment:
-      POSTGRES_USER: syncuser
-      POSTGRES_PASSWORD: syncpass
-      POSTGRES_DB: syncdb
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:

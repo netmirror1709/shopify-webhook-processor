@@ -1,7 +1,14 @@
 const amqp = require('amqplib');
+const { Pool } = require('pg');
+const axios = require('axios');
 require('dotenv').config();
+
 const QUEUE_NAME = process.env.RABBITMQ_QUEUE || 'shopify_webhooks_queue';
 const PREFETCH_COUNT = parseInt(process.env.CONSUMER_PREFETCH_COUNT) || 1;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || "postgresql://syncuser:syncpass@postgres:5432/syncdb",
+});
 
 let connection = null;
 let channel = null;
@@ -16,18 +23,16 @@ async function startConsumer() {
       console.log('⚠️ Shutting down, skipping new messages');
       return;
     }
-    console.log("Message");
-    const lineItems = message.body.line_items || [];
+    
+    const body = message.body || message;
+    const lineItems = body.line_items || [];
 
-    console.log('=== Order Line Items ===');
-    lineItems.forEach(item => {
+    console.log(`📦 Processing order with ${lineItems.length} line items`);
+    for (const item of lineItems) {
       console.log(`Variant ID: ${item.variant_id}, Quantity: ${item.quantity}`);
-
-      updateInventory(item.variant_id, item.quantity);
-
-    });
-    console.log("Message");
-    //await handleInventoryUpdate(message);
+      await updateInventory(item.variant_id, item.quantity);
+    }
+    console.log("✅ Finished processing order line items");
   });
 
   console.log('✅ Consumer is running and listening for messages...');
@@ -65,27 +70,32 @@ process.on('unhandledRejection', (error) => {
 
 
 
-async function connect() {
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function connect(retries = 10, delay = 5000) {
   if (connection && channel) return channel;
 
-  try {
-    connection = await amqp.connect(process.env.RABBITMQ_URL);
-    channel = await connection.createChannel();
+  for (let i = 0; i < retries; i++) {
+    try {
+      connection = await amqp.connect(process.env.RABBITMQ_URL);
+      channel = await connection.createChannel();
 
-    await channel.assertQueue(QUEUE_NAME, { durable: true });
-    await channel.prefetch(PREFETCH_COUNT);
+      await channel.assertQueue(QUEUE_NAME, { durable: true });
+      await channel.prefetch(PREFETCH_COUNT);
 
-    connection.on('error', (err) => {
-      console.error('❌ RabbitMQ Connection Error:', err);
-      connection = null;
-      channel = null;
-    });
+      connection.on('error', (err) => {
+        console.error('❌ RabbitMQ Connection Error:', err);
+        connection = null;
+        channel = null;
+      });
 
-    console.log('✅ Connected to RabbitMQ');
-    return channel;
-  } catch (error) {
-    console.error('❌ Failed to connect to RabbitMQ:', error);
-    throw error;
+      console.log('✅ Connected to RabbitMQ');
+      return channel;
+    } catch (error) {
+      console.error(`❌ Failed to connect to RabbitMQ (attempt ${i + 1}/${retries}):`, error.message);
+      if (i === retries - 1) throw error;
+      await sleep(delay);
+    }
   }
 }
 
@@ -109,17 +119,10 @@ async function consumeMessage(onMessage) {
   }, { noAck: false });
 }
 
-const { Pool } = require('pg');
-const axios = require('axios');
-
-const pool = new Pool({
-  connectionString: "postgresql://syncuser:syncpass@postgres:5432/syncdb",
-});
-
 // Shopify API base
 const SHOPIFY_API_VERSION = '2026-01';
 
-// Adjust inventory via Shopify Admin API
+// Adjust inventory via Shopify Admin API (GraphQL)
 async function adjustShopifyInventory({
   inventoryItemId,
   locationId,
@@ -127,14 +130,46 @@ async function adjustShopifyInventory({
   shopDomain,
   storeAccessKey
 }) {
-  const url = `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}/inventory_levels/adjust.json`;
+  const url = `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+
+  const query = `
+    mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
+      inventoryAdjustQuantities(input: $input) {
+        inventoryAdjustmentGroup {
+          createdAt
+          reason
+          changes {
+            name
+            delta
+          }
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const variables = {
+    input: {
+      reason: "CORRECTION",
+      name: "available",
+      changes: [
+        {
+          delta: delta,
+          inventoryItemId: `gid://shopify/InventoryItem/${String(inventoryItemId).split('/').pop()}`,
+          locationId: `gid://shopify/Location/${String(locationId).split('/').pop()}`
+        }
+      ]
+    }
+  };
 
   const response = await axios.post(
     url,
     {
-      inventory_item_id: inventoryItemId,
-      location_id: locationId,
-      available_adjustment: delta // positive or negative integer
+      query,
+      variables
     },
     {
       headers: {
@@ -144,6 +179,16 @@ async function adjustShopifyInventory({
       timeout: 10000
     }
   );
+
+  if (response.data.errors) {
+     throw new Error(JSON.stringify(response.data.errors));
+  }
+  
+  const data = response.data && response.data.data;
+  const userErrors = data && data.inventoryAdjustQuantities && data.inventoryAdjustQuantities.userErrors;
+  if (userErrors && userErrors.length > 0) {
+     throw new Error(JSON.stringify(userErrors));
+  }
 
   return response.data;
 }
@@ -194,12 +239,10 @@ async function updateInventory(variantId, delta) {
 
           console.log(`✅ Inventory adjusted for inventory_item_id: ${row.inventoryItemId}, location: ${row.locationId}`, result);
 
-
         } catch (shopifyError) {
-          console.error(`❌ Failed to adjust inventory for row:`, row, shopifyError.response?.data || shopifyError.message);
-          // Decide: continue or rollback? For partial failures, you may want to rollback:
-          // await client.query('ROLLBACK');
-          // return res.status(500).send('Inventory adjustment failed');
+          const errorMessage = (shopifyError.response && shopifyError.response.data) || shopifyError.message;
+          console.error(`❌ Failed to adjust inventory for row:`, row, errorMessage);
+          throw shopifyError;
         }
       }
 
@@ -210,11 +253,13 @@ async function updateInventory(variantId, delta) {
     } catch (dbError) {
       await client.query('ROLLBACK');
       console.error('❌ Database transaction failed:', dbError);
+      throw dbError;
     } finally {
       client.release();
     }
   } catch (error) {
     console.error('❌ Webhook handler error:', error);
+    throw error;
   }
 };
 
